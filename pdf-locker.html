@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Locker</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2230; --muted:#5d6678; --line:#d9dde5; --accent:#1f5eff; --ok:#1a8a4a; --bad:#c62828; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:520px; margin:40px auto; padding:28px; background:var(--card); border:1px solid var(--line); border-radius:12px; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { margin:0 0 22px; color:var(--muted); font-size:14px; }
+  .drop { display:block; border:2px dashed var(--line); border-radius:10px; padding:26px; text-align:center; cursor:pointer; color:var(--muted); margin-bottom:18px; }
+  .drop.over, .drop:hover { border-color:var(--accent); color:var(--accent); }
+  .drop.has { border-style:solid; border-color:var(--ok); color:var(--ink); }
+  label.f { display:block; font-weight:600; font-size:13px; margin:12px 0 4px; }
+  input[type=password], input[type=text] { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+  .meter { height:6px; background:var(--line); border-radius:3px; margin-top:6px; overflow:hidden; }
+  .meter i { display:block; height:100%; width:0; transition:width .2s, background .2s; }
+  .hint { font-size:12px; color:var(--muted); margin-top:4px; min-height:18px; }
+  button { margin-top:20px; width:100%; padding:12px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:600 15px system-ui,sans-serif; cursor:pointer; }
+  button:disabled { background:#a9b4c8; cursor:not-allowed; }
+  #status { margin:14px 0 0; font-size:14px; min-height:20px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDF Locker</h1>
+  <p class="sub">This tool turns a PDF into a password-protected HTML file. Encryption (AES-256) happens in your browser, so the PDF is never uploaded anywhere.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="file" accept="application/pdf,.pdf" hidden>
+    <span id="dropText">Click to choose a PDF, or drag one here</span>
+  </label>
+
+  <label class="f" for="pw">Password</label>
+  <input type="password" id="pw" autocomplete="new-password">
+  <div class="meter"><i id="bar"></i></div>
+  <div class="hint" id="pwHint">Use at least 12 characters.</div>
+
+  <label class="f" for="pw2">Confirm password</label>
+  <input type="password" id="pw2" autocomplete="new-password">
+  <div class="hint" id="matchHint"></div>
+
+  <label class="f" for="title">Title on the lock screen (optional)</label>
+  <input type="text" id="title" placeholder="e.g. Contract of Employment">
+
+  <button id="go" disabled>Create locked file</button>
+  <p id="status"></p>
+</main>
+
+<script>
+(() => {
+  const ITERATIONS = 600000;
+  const $ = id => document.getElementById(id);
+  let pdfBytes = null, pdfName = "";
+
+  // ---------- File selection ----------
+  const drop = $("drop"), fileInput = $("file");
+  fileInput.addEventListener("change", () => fileInput.files[0] && loadFile(fileInput.files[0]));
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => {
+    e.preventDefault(); drop.classList.remove("over");
+    if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+  });
+
+  async function loadFile(f) {
+    const buf = new Uint8Array(await f.arrayBuffer());
+    const head = String.fromCharCode(...buf.slice(0, 5));
+    if (head !== "%PDF-") { setStatus("That file doesn't look like a PDF.", "bad"); return; }
+    pdfBytes = buf; pdfName = f.name.replace(/\.pdf$/i, "");
+    $("dropText").textContent = `${f.name} (${(f.size / 1024).toFixed(0)} KB)`;
+    drop.classList.add("has"); setStatus(""); validate();
+  }
+
+  // ---------- Password checks ----------
+  function strength(p) {
+    let s = 0;
+    if (p.length >= 8) s++; if (p.length >= 12) s++; if (p.length >= 16) s++;
+    if (/[a-z]/.test(p) && /[A-Z]/.test(p)) s++;
+    if (/\d/.test(p)) s++; if (/[^A-Za-z0-9]/.test(p)) s++;
+    return Math.min(s, 5);
+  }
+  function validate() {
+    const p = $("pw").value, p2 = $("pw2").value, s = strength(p);
+    const colors = ["#c62828","#c62828","#e08a00","#e0b000","#3a9a4a","#1a8a4a"];
+    const words  = ["Too weak","Weak","Fair","Good","Strong","Very strong"];
+    $("bar").style.width = (p ? (s + 1) / 6 * 100 : 0) + "%";
+    $("bar").style.background = colors[s];
+    $("pwHint").textContent = p ? words[s] + (p.length < 12 ? ". Use at least 12 characters." : "") : "Use at least 12 characters.";
+    const match = p && p === p2;
+    $("matchHint").innerHTML = p2 ? (match ? '<span class="ok">Passwords match</span>' : '<span class="bad">Passwords don\'t match</span>') : "";
+    $("go").disabled = !(pdfBytes && match && p.length >= 8);
+  }
+  ["pw", "pw2"].forEach(id => $(id).addEventListener("input", validate));
+
+  // ---------- Encryption ----------
+  async function encrypt(bytes, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: ITERATIONS, hash: "SHA-256" },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes));
+    const out = new Uint8Array(16 + 12 + ct.length);   // layout: salt | iv | ciphertext
+    out.set(salt, 0); out.set(iv, 16); out.set(ct, 28);
+    return out;
+  }
+  function toBase64(u8) {
+    let s = "";
+    for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  const esc = s => s.replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+  $("go").addEventListener("click", async () => {
+    if (!window.crypto || !crypto.subtle) { setStatus("This browser can't run the encryption. Open the file in Chrome, Edge or Firefox.", "bad"); return; }
+    $("go").disabled = true; setStatus("Encrypting...");
+    try {
+      const enc = await encrypt(pdfBytes, $("pw").value);
+      const title = $("title").value.trim() || pdfName;
+      const html = buildViewer(esc(title), toBase64(enc), esc(pdfName));
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+      a.download = `${pdfName}_locked.html`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setStatus(`Done. ${pdfName}_locked.html has been downloaded. Send that file, and share the password separately.`, "ok");
+    } catch (e) {
+      setStatus("Something went wrong: " + e.message, "bad");
+    } finally { validate(); }
+  });
+
+  function setStatus(msg, cls) { $("status").textContent = msg; $("status").className = cls || ""; }
+
+  // ---------- The locked viewer file (template) ----------
+  function buildViewer(title, data, fileName) {
+    const S = "script"; // avoids a literal closing script tag inside this script
+    return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>${title} (protected)</title>
+<style>
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f6f7f9;color:#1c2230}
+#lock{max-width:380px;margin:12vh auto;padding:28px;background:#fff;border:1px solid #d9dde5;border-radius:12px;text-align:center}
+#lock h1{font-size:19px;margin:8px 0 4px}#lock p{color:#5d6678;font-size:13px;margin:0 0 18px}
+.ico{font-size:34px}
+input{width:100%;padding:11px 12px;border:1px solid #d9dde5;border-radius:8px;font:inherit}
+button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:8px;background:#1f5eff;color:#fff;font:600 15px system-ui,sans-serif;cursor:pointer}
+button:disabled{background:#a9b4c8}
+#err{color:#c62828;font-size:13px;min-height:20px;margin-top:10px}
+#view{display:none;height:100%;flex-direction:column}
+#bar{display:flex;gap:10px;align-items:center;padding:8px 14px;background:#1c2230;color:#fff;font-size:14px}
+#bar span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#bar a,#bar button{margin:0;width:auto;padding:6px 12px;font-size:13px;color:#fff;background:#3a4560;border-radius:6px;text-decoration:none}
+iframe{flex:1;border:0;width:100%}
+</style></head><body>
+<div id="lock">
+  <div class="ico">&#128274;</div>
+  <h1>${title}</h1>
+  <p>This document is password protected.</p>
+  <form id="f"><input type="password" id="pw" placeholder="Enter password" autofocus autocomplete="current-password">
+  <button id="btn">Unlock</button></form>
+  <div id="err"></div>
+</div>
+<div id="view">
+  <div id="bar"><span>${title}</span><a id="open" target="_blank" rel="noopener">Open in new tab</a><button id="lockBtn" type="button">Lock</button></div>
+  <iframe id="frame" title="${title}"></iframe>
+</div>
+<${S}>
+const DATA="${data}";
+const ITERATIONS=${ITERATIONS};
+function b64(s){const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u}
+let url=null;
+document.getElementById("f").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const btn=document.getElementById("btn"),err=document.getElementById("err"),pw=document.getElementById("pw");
+  if(!pw.value)return;
+  if(!window.crypto||!crypto.subtle){err.textContent="Please open this file in Chrome, Edge, Firefox or Safari.";return}
+  btn.disabled=true;btn.textContent="Unlocking...";err.textContent="";
+  try{
+    const raw=b64(DATA),salt=raw.slice(0,16),iv=raw.slice(16,28),ct=raw.slice(28);
+    const base=await crypto.subtle.importKey("raw",new TextEncoder().encode(pw.value),"PBKDF2",false,["deriveKey"]);
+    const key=await crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:ITERATIONS,hash:"SHA-256"},base,{name:"AES-GCM",length:256},false,["decrypt"]);
+    const pdf=await crypto.subtle.decrypt({name:"AES-GCM",iv},key,ct);
+    url=URL.createObjectURL(new Blob([pdf],{type:"application/pdf"}));
+    document.getElementById("frame").src=url;
+    document.getElementById("open").href=url;
+    document.getElementById("lock").style.display="none";
+    document.getElementById("view").style.display="flex";
+    pw.value="";
+  }catch(_){
+    err.textContent="Incorrect password. Please try again.";pw.select();
+  }finally{btn.disabled=false;btn.textContent="Unlock"}
+});
+document.getElementById("lockBtn").addEventListener("click",()=>{
+  if(url)URL.revokeObjectURL(url);url=null;
+  document.getElementById("frame").src="about:blank";
+  document.getElementById("view").style.display="none";
+  document.getElementById("lock").style.display="block";
+  document.getElementById("pw").focus();
+});
+</${S}>
+</body></html>`;
+  }
+})();
+</script>
+</body>
+</html>
